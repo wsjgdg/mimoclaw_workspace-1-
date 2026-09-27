@@ -29,13 +29,15 @@
   let TOKEN_READY = null;
 
   async function initSecurity() {
-    try {
-      const res = await fetch("/api/init");
-      const data = await res.json();
-      SESSION_TOKEN = data.token || "";
-    } catch (e) {
-      console.error("安全会话初始化失败：无法连接本地服务", e);
+    for (let i = 0; i < 3; i++) {
+      try {
+        const res = await fetch("/api/init");
+        const data = await res.json();
+        if (data.token) { SESSION_TOKEN = data.token; return; }
+      } catch (e) { /* 本地服务可能尚未就绪，稍后重试 */ }
+      await new Promise((r) => setTimeout(r, 400 * (i + 1)));
     }
+    console.error("安全会话初始化失败：无法从本地服务获取令牌");
   }
   TOKEN_READY = initSecurity();
 
@@ -535,7 +537,7 @@
       const timer = setTimeout(() => ctrl.abort(), 2500);
       const d = await fetch("/api/clipboard", { signal: ctrl.signal }).then((r) => r.json());
       clearTimeout(timer);
-      if (!d.ok || !d.text) return;
+      if (!d.ok || !d.text) return;   /* 后端节流命中 unchanged 时也走这里，直接跳过 */
       const text = d.text.trim();
       if (!text || text === lastClip) return;
       lastClip = text;
