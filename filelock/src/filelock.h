@@ -63,6 +63,7 @@
 
 typedef struct {
     long pid;
+    long ppid;        /* 父进程 ID（0/未知时前端按扁平列表展示） */
     char name[128];
     char detail[256];
 } Locker;
@@ -156,6 +157,9 @@ int  json_get_int(const char *json, const char *key, int def);
 int  json_array_strings(const char *json, const char *key, char out[][ITEM_LEN], int max);
 
 /* ---- httpd.c ---- */
+/* CSRF 会话令牌：服务启动前生成；危险 API 必须携带 X-Filelock-Token 请求头 */
+void httpd_init_token(void);
+const char *httpd_get_token(void);
 int  httpd_serve(const char *webroot, int *port, void (*on_ready)(int port));
 /* 阻塞式服务循环；port 传入期望端口，传出实际端口；on_ready 在服务就绪后回调 */
 void httpd_open_browser(int port);

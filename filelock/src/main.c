@@ -101,7 +101,8 @@ static void print_report_json(const char *path, const Report *r)
         char e1[256];
         json_escape(r->lockers[i].name, e1, sizeof(e1));
         o += (size_t)snprintf(out + o, sizeof(out) - o,
-            "%s{\"pid\":%ld,\"name\":\"%s\"}", i ? "," : "", r->lockers[i].pid, e1);
+            "%s{\"pid\":%ld,\"ppid\":%ld,\"name\":\"%s\"}", i ? "," : "",
+            r->lockers[i].pid, r->lockers[i].ppid, e1);
     }
     o += (size_t)snprintf(out + o, sizeof(out) - o, "],\"reasons\":[");
     for (int i = 0; i < r->nreasons && o + 600 < sizeof(out); i++) {
@@ -226,11 +227,13 @@ int main(int argc, char **argv)
     }
 
     int realport = port;
+    httpd_init_token();   /* CSRF 会话令牌（Web API 鉴权用） */
     printf("╔══════════════════════════════════════════════╗\n");
     printf("║  filelock — 文件占用诊断器                   ║\n");
     printf("╚══════════════════════════════════════════════╝\n");
     printf("  界面来源 : %s\n", webroot[0] ? webroot : "内嵌（单文件模式）");
     printf("  服务地址 : http://127.0.0.1:%d/  （若端口被占用会自动顺延）\n", realport);
+    printf("  安全令牌 : %.8s…（仅本机；危险 API 需携带 X-Filelock-Token）\n", httpd_get_token());
     printf("  （按 Ctrl+C 退出）\n\n");
 
     if (httpd_serve(webroot, &realport, no_open ? NULL : httpd_open_browser) != 0) {

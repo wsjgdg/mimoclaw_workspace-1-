@@ -4,6 +4,12 @@
 #include "filelock.h"
 #ifndef _WIN32
 #  include <pwd.h>
+#  if defined(__APPLE__)
+#    include <sys/sysctl.h>
+#  endif
+#endif
+#ifdef _WIN32
+#  include <tlhelp32.h>
 #endif
 
 /* ---------------- 通用工具 ---------------- */
@@ -139,6 +145,36 @@ static void win_proc_user(HANDLE hproc, char *out, size_t n)
 }
 #endif
 
+/* 父进程 ID（Windows：Toolhelp32 快照遍历） */
+static long proc_ppid_win(DWORD pid)
+{
+    long ppid = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == pid) { ppid = (long)pe.th32ParentProcessID; break; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return ppid;
+}
+
+/* 进程可执行文件完整路径（Windows）；失败返回 NULL */
+UNUSED_FN static const char *proc_exe_win(DWORD pid, char *out, size_t n)
+{
+    out[0] = 0;
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hp) return NULL;
+    WCHAR wexe[1024];
+    DWORD sz = 1024;
+    if (QueryFullProcessImageNameW(hp, 0, wexe, &sz)) utf8_from_wide(wexe, out, n);
+    CloseHandle(hp);
+    return out[0] ? out : NULL;
+}
+
 static DWORD try_open(const WCHAR *wpath, DWORD access, DWORD share, int dir)
 {
     DWORD flags = dir ? FILE_FLAG_BACKUP_SEMANTICS : FILE_ATTRIBUTE_NORMAL;
@@ -183,6 +219,7 @@ static int win_find_lockers(const WCHAR *wpath, Locker *out, int max)
     for (UINT i = 0; i < got && count < max; i++) {
         Locker *L = &out[count];
         L->pid = (long)info[i].Process.dwProcessId;
+        L->ppid = proc_ppid_win((DWORD)L->pid);
         utf8_from_wide(info[i].strAppName, L->name, sizeof(L->name));
         char extra[128] = "";
         switch (info[i].ApplicationType) {
@@ -360,12 +397,42 @@ static void posix_err_text(int e, char *out, size_t n)
     }
 }
 
+/* POSIX：读取父进程 ID（Linux 用 /proc，macOS 用 sysctl），失败返回 0 */
+static long posix_ppid(long pid)
+{
+#ifdef __linux__
+    char p[64], buf[1024];
+    snprintf(p, sizeof(p), "/proc/%ld/stat", pid);
+    FILE *f = fopen(p, "r");
+    if (!f) return 0;
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
+    fclose(f);
+    /* 格式: pid (comm) state ppid ...   comm 可能含空格/括号，从最后一个 ')' 之后解析 */
+    char *q = strrchr(buf, ')');
+    if (!q) return 0;
+    int state = 0, pp = 0;
+    if (sscanf(q + 1, "%d %d", &state, &pp) == 2 && pp > 0) return pp;
+    return 0;
+#elif defined(__APPLE__)
+    struct kinfo_proc kp;
+    size_t sz = sizeof(kp);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid };
+    if (sysctl(mib, 4, &kp, &sz, NULL, 0) == 0 && sz > 0)
+        return (long)kp.kp_eproc.e_ppid;
+    return 0;
+#else
+    (void)pid;
+    return 0;
+#endif
+}
+
 static int run_lsof(const char *path, Locker *out, int max, int deep)
 {
+    /* -F 机器可读输出：p=PID c=进程名 u=用户 f=完整路径行；据此推断被占用的具体文件 */
     char q[4096], cmd[8200];
     shell_quote(path, q, sizeof(q));
-    if (deep) snprintf(cmd, sizeof(cmd), "lsof -F pcu +D %s 2>/dev/null", q);
-    else      snprintf(cmd, sizeof(cmd), "lsof -F pcu -- %s 2>/dev/null", q);
+    if (deep) snprintf(cmd, sizeof(cmd), "lsof -F pcfu +D %s 2>/dev/null", q);
+    else      snprintf(cmd, sizeof(cmd), "lsof -F pcfu -- %s 2>/dev/null", q);
 
     FILE *fp = popen(cmd, "r");
     if (!fp) return -1;
@@ -375,52 +442,89 @@ static int run_lsof(const char *path, Locker *out, int max, int deep)
     long cur = -1;
     char curname[256] = "";
     char curuser[128] = "";
-    for (;;) {
-        if (!fgets(line, sizeof(line), fp)) break;
+    char firstfile[512] = "";   /* 该进程第一条命中目标的路径行 */
+
+    /* 把当前进程记录进 out（自动去重） */
+#define FLUSH_PROC()                                                        \
+    do {                                                                    \
+        if (cur > 0 && count < max) {                                       \
+            int dup = 0;                                                    \
+            for (int i = 0; i < count; i++)                                 \
+                if (out[i].pid == cur) { dup = 1; break; }                  \
+            if (!dup) {                                                     \
+                out[count].pid = cur;                                       \
+                out[count].ppid = posix_ppid(cur);                          \
+                snprintf(out[count].name, sizeof(out[count].name), "%.*s",  \
+                         (int)sizeof(out[count].name) - 1, curname);        \
+                if (firstfile[0] && strcmp(firstfile, path) != 0) {         \
+                    if (curuser[0])                                         \
+                        snprintf(out[count].detail, sizeof(out[count].detail), \
+                                 "lsof · 占用 %.200s · 用户 %s", firstfile, curuser); \
+                    else                                                    \
+                        snprintf(out[count].detail, sizeof(out[count].detail), \
+                                 "lsof · 占用 %.220s", firstfile);          \
+                } else if (curuser[0]) {                                    \
+                    snprintf(out[count].detail, sizeof(out[count].detail),  \
+                             "lsof · 用户 %s", curuser);                    \
+                } else {                                                    \
+                    snprintf(out[count].detail, sizeof(out[count].detail),  \
+                             "lsof 扫描");                                  \
+                }                                                           \
+                count++;                                                    \
+            }                                                               \
+        }                                                                   \
+    } while (0)
+
+    while (fgets(line, sizeof(line), fp)) {
         size_t l = strlen(line);
         while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
         if (l < 2) continue;
-        if (line[0] == 'p') {
-            if (cur > 0 && count < max) {
-                int dup = 0;
-                for (int i = 0; i < count; i++) if (out[i].pid == cur) { dup = 1; break; }
-                if (!dup) {
-                    out[count].pid = cur;
-                    snprintf(out[count].name, sizeof(out[count].name), "%.*s",
-                             (int)sizeof(out[count].name) - 1, curname);
-                    if (curuser[0])
-                        snprintf(out[count].detail, sizeof(out[count].detail), "lsof · 用户 %s", curuser);
-                    else
-                        snprintf(out[count].detail, sizeof(out[count].detail), "lsof 扫描");
-                    count++;
-                }
-            }
+        switch (line[0]) {
+        case 'p':
+            FLUSH_PROC();
             cur = atol(line + 1);
             curname[0] = 0;
             curuser[0] = 0;
-        } else if (line[0] == 'c' && cur > 0 && !curname[0]) {
-            snprintf(curname, sizeof(curname), "%.*s", (int)sizeof(curname) - 1, line + 1);
-        } else if (line[0] == 'u' && cur > 0 && !curuser[0]) {
-            snprintf(curuser, sizeof(curuser), "%.*s", (int)sizeof(curuser) - 1, line + 1);
+            firstfile[0] = 0;
+            break;
+        case 'c':
+            if (cur > 0 && !curname[0])
+                snprintf(curname, sizeof(curname), "%.*s", (int)sizeof(curname) - 1, line + 1);
+            break;
+        case 'u':
+            if (cur > 0 && !curuser[0])
+                snprintf(curuser, sizeof(curuser), "%.*s", (int)sizeof(curuser) - 1, line + 1);
+            break;
+        case 'f':
+            /* 路径字段（跳过 fd 编号与 (type) 括号说明） */
+            if (cur > 0 && !firstfile[0]) {
+                char namebuf[512];
+                snprintf(namebuf, sizeof(namebuf), "%.*s", (int)sizeof(namebuf) - 1, line + 1);
+                size_t nl = strlen(namebuf);
+                if (nl >= 2 && namebuf[nl-1] == ')' && namebuf[nl-2] == '(') {
+                    char *lp = strrchr(namebuf, '(');
+                    if (lp) {
+                        size_t tl = strlen(lp + 1);
+                        memmove(lp, lp + 1, tl + 1);   /* 去掉 "(TYPE)" 尾巴 */
+                    }
+                }
+                const char *np = strchr(namebuf, ' ');
+                np = np ? np + 1 : NULL;               /* 跳过 "txt"/"mem"/"cwd"/fd 号等前缀 */
+                if (np && (*np == '/' || *np == '\\') && strstr(np, path) == NULL &&
+                    strncmp(np, path, strlen(path)) != 0) {
+                    snprintf(firstfile, sizeof(firstfile), "%s", np);
+                }
+            }
+            break;
+        default: break;
         }
     }
-    if (cur > 0 && count < max) {
-        int dup = 0;
-        for (int i = 0; i < count; i++) if (out[i].pid == cur) { dup = 1; break; }
-        if (!dup) {
-            out[count].pid = cur;
-            snprintf(out[count].name, sizeof(out[count].name), "%.*s",
-                     (int)sizeof(out[count].name) - 1, curname);
-            if (curuser[0])
-                snprintf(out[count].detail, sizeof(out[count].detail), "lsof · 用户 %s", curuser);
-            else
-                snprintf(out[count].detail, sizeof(out[count].detail), "lsof 扫描");
-            count++;
-        }
-    }
+    FLUSH_PROC();
+#undef FLUSH_PROC
     pclose(fp);
     return count;
 }
+
 
 #ifdef __linux__
 static void proc_user(long pid, char *out, size_t n)
@@ -464,6 +568,7 @@ static int proc_scan(const char *path, Locker *out, int max, int is_dir, int dee
             for (int i = 0; i < count; i++) if (out[i].pid == pid) { dup = 1; break; }
             if (dup) continue;
             out[count].pid = pid;
+            out[count].ppid = posix_ppid(pid);
             snprintf(out[count].name, sizeof(out[count].name), "%.*s",
                      (int)sizeof(out[count].name) - 1, base_name(link)); /* 占位，下面覆盖 */
             {
@@ -518,12 +623,20 @@ static int proc_scan(const char *path, Locker *out, int max, int is_dir, int dee
                 fclose(cf);
             }
             out[count].pid = pid;
+            out[count].ppid = posix_ppid(pid);
             snprintf(out[count].name, sizeof(out[count].name), "%.*s",
                      (int)sizeof(out[count].name) - 1, comm);
             {
                 char user[64] = "";
                 proc_user(pid, user, sizeof(user));
-                if (user[0])
+                const char *shown = (strncmp(target, path, plen) == 0 && target[plen]) ? target : NULL;
+                if (shown && user[0])
+                    snprintf(out[count].detail, sizeof(out[count].detail),
+                             "fd %.160s · 占用 %.180s · 用户 %s", fe->d_name, shown, user);
+                else if (shown)
+                    snprintf(out[count].detail, sizeof(out[count].detail),
+                             "fd %.160s · 占用 %.220s", fe->d_name, shown);
+                else if (user[0])
                     snprintf(out[count].detail, sizeof(out[count].detail), "fd %.180s · 用户 %s", fe->d_name, user);
                 else
                     snprintf(out[count].detail, sizeof(out[count].detail), "fd %.200s", fe->d_name);
@@ -668,11 +781,19 @@ static int diag_posix(const char *path, Report *r, int deep)
     if (!realpath(path, abspath)) snprintf(abspath, sizeof(abspath), "%s", path);
 
     int n = -1;
+#ifdef __linux__
+    /* Linux：优先原生 /proc 扫描（零依赖、毫秒级；Docker/Alpine 等精简系统常无 lsof），
+       找不到再回退 lsof（可看到内核态/其他用户的句柄） */
+    n = proc_scan(abspath, r->lockers, MAX_LOCKERS, r->is_dir, deep);
+    if (n <= 0) {
+        FILE *chk = popen("command -v lsof >/dev/null 2>&1", "r");
+        int has_lsof = chk && (pclose(chk) == 0);
+        if (has_lsof) n = run_lsof(abspath, r->lockers, MAX_LOCKERS, deep && r->is_dir);
+    }
+#else
     FILE *chk = popen("command -v lsof >/dev/null 2>&1", "r");
     int has_lsof = chk && (pclose(chk) == 0);
     if (has_lsof) n = run_lsof(abspath, r->lockers, MAX_LOCKERS, deep && r->is_dir);
-#ifdef __linux__
-    if (n <= 0) n = proc_scan(abspath, r->lockers, MAX_LOCKERS, r->is_dir, deep);
 #endif
 
     if (n > 0) {

@@ -385,3 +385,69 @@ footer {
   .row.btns .btn { width: 100%; }
   #toastWrap { left: 12px; right: 12px; max-width: none; }
 }
+
+/* ---- 进程树可视化（占用进程表格内嵌层级） ---- */
+.locker-table .pid { white-space: nowrap; }
+.tw-indent { display: inline-block; vertical-align: -2px; }
+.arrow, .arrow-spacer {
+  display: inline-block;
+  width: 18px;
+  text-align: center;
+}
+.arrow {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+  transition: transform .18s ease;
+  user-select: none;
+}
+.tree-row.collapsed .arrow { transform: rotate(-90deg); }
+.node-icon { margin-right: 4px; }
+tr.hidden { display: none; }
+.tree-row td.pname { border-left: 3px solid transparent; }
+.tree-row[data-level]:not([data-level="0"]) td.pname { border-left-color: var(--line); }
+
+/* ---- 深色模式（自动跟随系统 prefers-color-scheme） ---- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --ink: #f8fafc;
+    --muted: #94a3b8;
+    --line: #334155;
+    --accent: #818cf8;
+    --accent-2: #6366f1;
+    --green: #4ade80;
+    --red: #f87171;
+    --amber: #fbbf24;
+    --shadow: 0 4px 18px rgba(0, 0, 0, .4);
+  }
+
+  header { background: linear-gradient(135deg, #1e1b4b 0%, #312e81 55%, #4338ca 100%); }
+
+  input[type="text"], textarea, select {
+    background: #0f172a;
+    color: var(--ink);
+    border-color: var(--line);
+  }
+  ::placeholder { color: #64748b; opacity: 1; }
+
+  .card { border: 1px solid var(--line); }
+  .tab { background: #0f172a; color: var(--muted); }
+  .tab.active { background: var(--accent); color: #0f172a; }
+  .chip { background: #0f172a; color: var(--ink); border-color: var(--line); }
+  .btn.ghost { background: #0f172a; color: var(--ink); border-color: var(--line); }
+  .btn.ghost:hover { background: #1e293b; border-color: var(--accent-2); }
+  .locker-table th { background: #16203a; }
+  .badge { background: #1e293b; color: var(--muted); }
+  .badge.ok { background: rgba(22, 101, 52, .35); }
+  .badge.bad { background: rgba(127, 29, 29, .4); }
+  .badge.neutral { background: rgba(49, 46, 129, .5); color: var(--accent); }
+  .path-link { background: #16203a; color: var(--ink); }
+  .path-link:hover { background: #1e293b; }
+  .hist-item { background: #16203a; }
+  .hist-item:hover { background: #1e293b; }
+  .toast { background: #1e293b; color: var(--ink); box-shadow: 0 10px 30px rgba(0, 0, 0, .5); }
+  .drop-inner { background: #1e293b; }
+  .conclusion.warn { background: rgba(120, 53, 15, .35); color: var(--amber); }
+}

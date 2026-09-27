@@ -21,12 +21,36 @@
       .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
+  /* ---------- CSRF 会话令牌 ----------
+   * 后端只监听 127.0.0.1，但本机任意网页仍可向该端口发请求（CSRF / DNS rebinding），
+   * 在用户不知情时结束进程、删除文件。页面加载时先取回随机令牌，
+   * 所有危险 API（POST）必须携带 X-Filelock-Token 请求头。 */
+  let SESSION_TOKEN = "";
+  let TOKEN_READY = null;
+
+  async function initSecurity() {
+    try {
+      const res = await fetch("/api/init");
+      const data = await res.json();
+      SESSION_TOKEN = data.token || "";
+    } catch (e) {
+      console.error("安全会话初始化失败：无法连接本地服务", e);
+    }
+  }
+  TOKEN_READY = initSecurity();
+
   async function api(url, payload) {
+    if (!TOKEN_READY) TOKEN_READY = initSecurity();
+    await TOKEN_READY;
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Filelock-Token": SESSION_TOKEN
+      },
       body: JSON.stringify(payload || {})
     });
+    if (res.status === 403) throw new Error("安全校验失败，请刷新页面重试");
     return res.json();
   }
 
@@ -141,6 +165,43 @@
     list.innerHTML = arr.map((s) => "<li>" + esc(s) + "</li>").join("");
   }
 
+  /* ---------- 进程树可视化 ----------
+   * 利用后端返回的 ppid 把扁平占用列表组织成父子层级；
+   * 父进程不在列表中或无 ppid 信息时自动退化为扁平展示。 */
+  function buildProcessTree(lockers) {
+    const map = {}, roots = [];
+    lockers.forEach((l) => { map[l.pid] = Object.assign({}, l, { children: [] }); });
+    lockers.forEach((l) => {
+      const node = map[l.pid];
+      if (node.ppid && map[node.ppid] && node.ppid !== node.pid) map[node.ppid].children.push(node);
+      else roots.push(node);
+    });
+    /* 防御异常数据导致的环：从根出发遍历不到的节点补挂到顶层 */
+    const seen = new Set();
+    (function mark(ns) { ns.forEach((n) => { if (!seen.has(n.pid)) { seen.add(n.pid); mark(n.children); } }); })(roots);
+    lockers.forEach((l) => { if (!seen.has(l.pid)) { seen.add(l.pid); roots.push(map[l.pid]); } });
+    return roots;
+  }
+
+  function renderTreeRows(nodes, level, out) {
+    nodes.forEach((node) => {
+      const hasKids = node.children && node.children.length > 0;
+      const indent = level * 20;
+      out.push(
+        `<tr class="tree-row${hasKids ? "" : " leaf"}" data-level="${level}"${hasKids ? ` data-expandable="1"` : ""}>` +
+          `<td class="pid">` +
+            `<span class="tw-indent" style="width:${indent}px"></span>` +
+            (hasKids ? '<span class="arrow">▼</span>' : '<span class="arrow-spacer"></span>') +
+            esc(node.pid) +
+          `</td>` +
+          `<td class="pname"><span class="node-icon">${hasKids ? "📂" : "📄"}</span> ${esc(node.name || "(未知)")}</td>` +
+          `<td class="detail">${esc(node.detail || "-")}</td>` +
+          `<td><button class="btn danger" data-pid="${esc(node.pid)}" data-name="${esc(node.name || "")}">结束此进程</button></td>` +
+        `</tr>`);
+      if (hasKids) renderTreeRows(node.children, level + 1, out);
+    });
+  }
+
   function renderLockers(lockers) {
     const block = $("lockerBlock"), body = $("lockerBody");
     if (!lockers.length) {
@@ -149,13 +210,23 @@
       return;
     }
     block.classList.remove("hidden");
-    body.innerHTML = lockers.map((l) => `
-      <tr>
-        <td class="pid">${esc(l.pid)}</td>
-        <td class="pname">${esc(l.name || "(未知)")}</td>
-        <td class="detail">${esc(l.detail || "-")}</td>
-        <td><button class="btn danger" data-pid="${esc(l.pid)}" data-name="${esc(l.name || "")}">结束此进程</button></td>
-      </tr>`).join("");
+    const rows = [];
+    renderTreeRows(buildProcessTree(lockers), 0, rows);
+    body.innerHTML = rows.join("");
+
+    /* 展开 / 折叠：隐藏被折叠节点的所有后代行 */
+    body.querySelectorAll("tr[data-expandable]").forEach((tr) => {
+      tr.querySelector(".arrow").addEventListener("click", (e) => {
+        e.stopPropagation();
+        const collapsed = tr.classList.toggle("collapsed");
+        const lvl = +tr.dataset.level;
+        let n = tr.nextElementSibling;
+        while (n && +n.dataset.level > lvl) {
+          n.classList.toggle("hidden", collapsed);
+          n = n.nextElementSibling;
+        }
+      });
+    });
 
     body.querySelectorAll(".btn.danger").forEach((btn) => {
       btn.addEventListener("click", async () => {
@@ -512,6 +583,52 @@
     return lines.join("\n");
   }
 
+  /* ---------- 导出 Markdown 报告（方便归档 / 发给同事） ---------- */
+  function buildReportMarkdown() {
+    const title = $("resultTitle").textContent.trim() || "诊断结果";
+    let md = "# filelock " + title + "\n\n";
+    const path = $("pathInput").value.trim();
+    if (path) md += "**目标路径**: `" + path + "`\n\n";
+    const badges = [...document.querySelectorAll("#statusRow .badge")].map((b) => b.textContent.trim());
+    if (badges.length) md += "**状态**: " + badges.join(" | ") + "\n\n";
+
+    const rows = [...document.querySelectorAll("#lockerBody tr")]
+      .filter((tr) => !$("lockerBlock").classList.contains("hidden"));
+    if (rows.length) {
+      md += "## 🔒 占用进程\n\n| PID | 进程名 | 详情 |\n|---|---|---|\n";
+      rows.forEach((tr) => {
+        const td = tr.querySelectorAll("td");
+        md += "| " + td[0].textContent.trim() + " | " + td[1].textContent.trim() +
+              " | " + td[2].textContent.trim() + " |\n";
+      });
+      md += "\n";
+    }
+    const grab = (blockId, listId) =>
+      [...document.querySelectorAll("#" + listId + " li")]
+        .filter(() => !$(blockId).classList.contains("hidden"))
+        .map((li) => li.textContent.trim());
+    const reasons = grab("reasonBlock", "reasonList");
+    if (reasons.length) md += "## 🔍 原因分析\n\n" + reasons.map((r) => "- " + r).join("\n") + "\n\n";
+    const fixes = grab("fixBlock", "fixList");
+    if (fixes.length) md += "## 🛠 解决办法\n\n" + fixes.map((f, i) => (i + 1) + ". " + f).join("\n") + "\n\n";
+    const concl = $("conclusion").textContent.trim();
+    if (concl) md += "**结论**: " + concl + "\n";
+    md += "\n> 由 filelock 本地生成 · " + new Date().toLocaleString() + "\n";
+    return md;
+  }
+
+  function exportReportMarkdown() {
+    const blob = new Blob([buildReportMarkdown()], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "filelock_report_" + Date.now() + ".md";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
   $("copyReport").addEventListener("click", async () => {
     const text = buildReportText();
     try {
@@ -526,6 +643,11 @@
       ta.remove();
       showToast("✅ 已复制到剪贴板", "可以直接粘贴发给别人了", null);
     }
+  });
+
+  $("exportMd").addEventListener("click", () => {
+    try { exportReportMarkdown(); }
+    catch (e) { showError("导出失败：" + e.message); }
   });
 
   /* ---------- 检测历史 ---------- */
