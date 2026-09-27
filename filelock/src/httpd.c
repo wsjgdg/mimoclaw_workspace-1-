@@ -6,11 +6,18 @@
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
 #  include <process.h>
+#  include <wincrypt.h>
+#else
+#  include <time.h>
 #endif
 #include "filelock.h"
 #include "web_embedded.h"   /* 构建时由 tools/embed_web.c 生成 */
 #ifndef _WIN32
 #  include <pthread.h>
+#endif
+
+#ifdef _MSC_VER
+#  pragma comment(lib, "advapi32.lib")
 #endif
 
 #ifdef _MSC_VER
@@ -77,6 +84,89 @@ static void send_response(sock_t s, int code, const char *ctype, const char *bod
 static void send_json(sock_t s, const char *json)
 {
     send_response(s, 200, "application/json; charset=utf-8", json, strlen(json));
+}
+
+/* ---------- CSRF 会话令牌 ----------
+ * 服务只监听 127.0.0.1，但本机上的任意网页仍可向本端口发起请求（DNS rebinding /
+ * CSRF），从而在用户不知情时结束进程、删除文件。为此：
+ *   1. 启动时生成随机 Token；前端页面加载后先 GET /api/init 取回 Token；
+ *   2. 所有危险 API（POST）必须携带 X-Filelock-Token 请求头，否则返回 403；
+ *   3. 响应带 Access-Control-Allow-Origin: *，但自定义请求头会触发 CORS 预检，
+ *      而服务端不允许该头 → 跨源脚本无法完成危险调用（简单请求则不带 Token → 403）。
+ */
+#define TOKEN_HEADER "X-Filelock-Token"
+
+static char g_session_token[65] = { 0 };
+
+void httpd_init_token(void)
+{
+    unsigned char buf[32];
+    int ok = 0;
+#ifdef _WIN32
+    HCRYPTPROV hProv = 0;
+    if (CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        ok = CryptGenRandom(hProv, 32, buf) ? 1 : 0;
+        CryptReleaseContext(hProv, 0);
+    }
+#else
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) { ok = (fread(buf, 1, 32, f) == 32) ? 1 : 0; fclose(f); }
+#endif
+    if (!ok) {   /* 兜底：时间 + PID 混合播种 */
+#ifdef _WIN32
+        srand((unsigned)time(NULL) ^ (unsigned)GetCurrentProcessId());
+#else
+        srand((unsigned)time(NULL) ^ (unsigned)getpid());
+#endif
+        for (int i = 0; i < 32; i++) buf[i] = (unsigned char)(rand() & 0xFF);
+    }
+    for (int i = 0; i < 32; i++) sprintf(g_session_token + i * 2, "%02x", buf[i]);
+    g_session_token[64] = 0;
+}
+
+const char *httpd_get_token(void)
+{
+    if (!g_session_token[0]) httpd_init_token();
+    return g_session_token;
+}
+
+/* 从原始请求头中提取指定头的值（大小写不敏感），写入 out；找不到返回 0 */
+static int get_header(const char *req, const char *name, char *out, size_t n)
+{
+    size_t nl = strlen(name);
+    const char *hdr_end = strstr(req, "\r\n\r\n");
+    for (const char *p = req; p && (!hdr_end || p < hdr_end); ) {
+        const char *eol = strstr(p, "\r\n");
+        const char *line_end = eol ? eol : (hdr_end ? hdr_end : p + strlen(p));
+        if ((size_t)(line_end - p) > nl && strncasecmp(p, name, nl) == 0 && p[nl] == ':') {
+            const char *v = p + nl + 1;
+            while (v < line_end && (*v == ' ' || *v == '\t')) v++;
+            size_t len = (size_t)(line_end - v);
+            while (len && (v[len - 1] == ' ' || v[len - 1] == '\t')) len--;
+            if (len >= n) len = n - 1;
+            memcpy(out, v, len);
+            out[len] = 0;
+            return 1;
+        }
+        if (!eol) break;
+        p = eol + 2;
+    }
+    return 0;
+}
+
+static void send_forbidden(sock_t s)
+{
+    const char *err = "{\"ok\":0,\"error\":\"CSRF 令牌校验失败：请刷新页面重试\"}";
+    send_response(s, 403, "application/json; charset=utf-8", err, strlen(err));
+}
+
+/* GET /api/init —— 下发会话令牌与版本信息 */
+static void api_init(sock_t s)
+{
+    char out[256];
+    snprintf(out, sizeof(out), "{\"ok\":1,\"token\":\"%s\",\"version\":\"1.2\"}",
+             httpd_get_token());
+    send_json(s, out);
 }
 
 static int read_request(sock_t s, char *buf, size_t cap, size_t *out_len)
@@ -151,8 +241,8 @@ static void api_scan(sock_t s, const char *body)
         json_escape(r.lockers[i].name, n1, sizeof(n1));
         json_escape(r.lockers[i].detail, n2, sizeof(n2));
         o += (size_t)snprintf(out + o, sizeof(out) - o,
-            "%s{\"pid\":%ld,\"name\":\"%s\",\"detail\":\"%s\"}", i ? "," : "",
-            r.lockers[i].pid, n1, n2);
+            "%s{\"pid\":%ld,\"ppid\":%ld,\"name\":\"%s\",\"detail\":\"%s\"}", i ? "," : "",
+            r.lockers[i].pid, r.lockers[i].ppid, n1, n2);
     }
     o += (size_t)snprintf(out + o, sizeof(out) - o, "],\"reasons\":[");
     for (int i = 0; i < r.nreasons && o + 1024 < sizeof(out); i++) {
@@ -501,10 +591,21 @@ static void handle_conn(sock_t s, const char *webroot)
     body = body ? body + 4 : buf + len;
 
     if (strcmp(method, "GET") == 0) {
-        if (strcmp(url, "/api/clipboard") == 0) api_clipboard(s);
+        if (strcmp(url, "/api/init") == 0) api_init(s);
+        else if (strcmp(url, "/api/clipboard") == 0) api_clipboard(s);
         else if (strcmp(url, "/api/history") == 0) api_history(s);
         else serve_static(s, webroot, url);
     } else if (strcmp(method, "POST") == 0) {
+        /* CSRF 防护：所有 /api/ 危险操作必须携带有效会话令牌 */
+        if (strncmp(url, "/api/", 5) == 0) {
+            char tok[128] = "";
+            if (!get_header(buf, TOKEN_HEADER, tok, sizeof(tok)) ||
+                strcmp(tok, httpd_get_token()) != 0) {
+                send_forbidden(s);
+                free(buf);
+                return;
+            }
+        }
         if (strcmp(url, "/api/scan") == 0) api_scan(s, body);
         else if (strcmp(url, "/api/scan-batch") == 0) api_scan_batch(s, body);
         else if (strcmp(url, "/api/force-clean") == 0) api_force_clean(s, body);
@@ -548,6 +649,7 @@ static void *conn_thread(void *p)
 
 int httpd_serve(const char *webroot, int *port, void (*on_ready)(int port))
 {
+    httpd_init_token();   /* CSRF 会话令牌：每次启动随机生成 */
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return -1;
