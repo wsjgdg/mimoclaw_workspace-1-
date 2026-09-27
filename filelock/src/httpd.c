@@ -527,6 +527,38 @@ int safe_remove_path(const char *path, int is_dir, char *errbuf, size_t n)
 #endif
 }
 
+/* 自我保护：路径是否落在 webroot（本程序界面目录）内。
+ * 源码运行模式下 webroot 指向仓库 web/，误删会导致界面丢失；
+ * 匹配时做大小写归一化（Windows 文件名不区分大小写），并同时比对
+ * 绝对 webroot 与进程当前工作目录下的相对 "web" 两种形态。 */
+static int path_in_webroot(const char *path)
+{
+    if (!path || !path[0]) return 0;
+    char cwd[4096] = "";
+    const char *roots[2];
+    size_t lens[2];
+    int nr = 0;
+    if (g_webroot[0]) { roots[nr] = g_webroot; lens[nr] = strlen(g_webroot); nr++; }
+    if (getcwd(cwd, sizeof(cwd))) {
+        static char rel[4160];
+        snprintf(rel, sizeof(rel), "%s/web", cwd);
+        roots[nr] = rel; lens[nr] = strlen(rel); nr++;
+    }
+    for (int k = 0; k < nr; k++) {
+        size_t wl = lens[k];
+        int match = 1;
+        if (strlen(path) < wl) continue;
+        for (size_t i = 0; i < wl; i++) {
+            char a = path[i], b = roots[k][i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b && !(b == '/' && a == '\\')) { match = 0; break; }
+        }
+        if (match && (path[wl] == '/' || path[wl] == '\\' || path[wl] == 0)) return 1;
+    }
+    return 0;
+}
+
 static void api_act(sock_t s, const char *body)
 {
     char path[4096] = "", op[32] = "";
@@ -541,12 +573,9 @@ static void api_act(sock_t s, const char *body)
     }
     /* 自我保护：拒绝删除本程序目录下的 web 资源（源码运行模式下
      * webroot 指向仓库内 web/，误删会导致界面丢失） */
-    if (g_webroot[0]) {
-        size_t wl = strlen(g_webroot);
-        if (strncmp(path, g_webroot, wl) == 0 && (path[wl] == '/' || path[wl] == '\\')) {
-            send_json(s, "{\"ok\":0,\"error\":\"出于安全考虑，不允许删除 filelock 自身的界面文件\"}");
-            return;
-        }
+    if (path_in_webroot(path)) {
+        send_json(s, "{\"ok\":0,\"error\":\"出于安全考虑，不允许删除 filelock 自身的界面文件\"}");
+        return;
     }
     struct stat st;
     int is_dir = (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
@@ -612,12 +641,9 @@ static void api_force_clean(sock_t s, const char *body)
     int is_dir = (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
 
     /* 自我保护：拒绝删除本程序目录下的 web 资源（与 /api/act 同规则） */
-    if (g_webroot[0]) {
-        size_t wl = strlen(g_webroot);
-        if (strncmp(path, g_webroot, wl) == 0 && (path[wl] == '/' || path[wl] == '\\')) {
-            send_json(s, "{\"ok\":0,\"error\":\"出于安全考虑，不允许删除 filelock 自身的界面文件\"}");
-            return;
-        }
+    if (path_in_webroot(path)) {
+        send_json(s, "{\"ok\":0,\"error\":\"出于安全考虑，不允许删除 filelock 自身的界面文件\"}");
+        return;
     }
 
     /* 1) 句柄级解锁（Windows） */
@@ -679,7 +705,9 @@ static void api_history(sock_t s, const char *query)
     if (per < 1) per = 10;
     if (per > 50) per = 50;                 /* 单页上限 */
 
-    HistoryItem items[50];
+    /* 修复越界：per 上限 100（与 history_page 对齐），items 容量必须同步为 100，
+     * 否则 ?per=50..100 时 history_page 会向栈数组越界写入 */
+    HistoryItem items[100];
     long long total = 0;
     int n = history_page(items, per, page, per, &total);
 
@@ -721,6 +749,23 @@ static void api_history_clear(sock_t s)
 {
     int rc = history_clear();
     send_json(s, rc == 0 ? "{\"ok\":1}" : "{\"ok\":0,\"error\":\"清空失败\"}");
+}
+
+/* ---------- /api/health —— 只读健康检查（供自动化测试 / 监控使用） ----------
+ * GET 请求、无需令牌；输出运行状态、会话活跃标记、版本号与服务启动时间。
+ * 刻意不泄露令牌本身，tokenReady 仅表示"已生成"。 */
+static volatile long long g_start_time = 0;
+
+static void api_health(sock_t s)
+{
+    char out[512];
+    time_t now = time(NULL);
+    long long uptime = g_start_time ? (long long)now - g_start_time : 0;
+    snprintf(out, sizeof(out),
+             "{\"ok\":1,\"status\":\"healthy\",\"version\":\"1.2\","
+             "\"tokenReady\":%d,\"activeConns\":%ld,\"uptimeSec\":%lld,\"time\":%lld}",
+             httpd_get_token()[0] ? 1 : 0, conn_count(), uptime, (long long)now);
+    send_json(s, out);
 }
 
 static void api_browse(sock_t s, const char *body)
@@ -965,6 +1010,7 @@ static void handle_conn(sock_t s, const char *webroot)
         if (strcmp(url, "/favicon.ico") == 0) {
             send_response(s, 200, "image/svg+xml", EMB_FAVICON_SVG, sizeof(EMB_FAVICON_SVG) - 1);
         } else if (strcmp(url, "/api/init") == 0) api_init(s);
+        else if (strcmp(url, "/api/health") == 0) api_health(s);
         else if (strcmp(url, "/api/clipboard") == 0) api_clipboard(s);
         else if (strcmp(url, "/api/history") == 0) api_history(s, query);
         else serve_static(s, webroot, url);
@@ -1053,6 +1099,7 @@ int httpd_serve(const char *webroot, int *port, void (*on_ready)(int port))
     if (listen(srv, 8) == SOCK_ERR) { CLOSESOCK(srv); return -1; }
 
     snprintf(g_webroot, sizeof(g_webroot), "%s", webroot ? webroot : "");
+    g_start_time = (long long)time(NULL);   /* /api/health 的 uptime 基准 */
     if (on_ready) on_ready(*port);
 
     for (;;) {

@@ -61,29 +61,31 @@ int history_add(const char *path, const Report *r)
             esc_path, esc_con, r->exists, r->nlockers, r->restricted, (long)time(NULL));
     fclose(f);
 
-    /* 超量截断：保留最近 HISTORY_FILE_MAX-50 条 */
+    /* 超量截断：文件按时间正序追加，因此应丢弃最旧的行、保留最近的行。
+     * （旧实现的 head+skip 写法恰好相反，会把最新记录删掉——已修正为
+     *   环形缓冲：始终只记住最后 KEEP_TAIL 条，写回时天然保序。） */
     FILE *rf = fopen(hf, "r");
     if (rf) {
-        int lines = 0;
+        #define KEEP_TAIL (HISTORY_FILE_MAX - 50)
+        static char ring[KEEP_TAIL][2048];   /* 静态分配，避免栈溢出 */
+        int lines = 0, w = 0;
         char buf[2048];
-        while (fgets(buf, sizeof(buf), rf)) lines++;
+        while (fgets(buf, sizeof(buf), rf)) {
+            if (buf[strcspn(buf, "\n")] || strlen(buf) >= sizeof(buf) - 1) continue; /* 跳过异常超长行 */
+            memcpy(ring[w], buf, strlen(buf) + 1);
+            w = (w + 1) % KEEP_TAIL;
+            lines++;
+        }
         fclose(rf);
         if (lines > HISTORY_FILE_MAX) {
-            FILE *rf2 = fopen(hf, "r");
-            char *keep = (char *)malloc((size_t)lines * 2048);
-            if (rf2 && keep) {
-                char *store = keep;
-                int skip = lines - (HISTORY_FILE_MAX - 50);
-                int idx = 0;
-                while (fgets(store, 2048, rf2)) {
-                    if (idx++ < skip) continue;
-                    store += strlen(store);
+            FILE *wf = fopen(hf, "w");
+            if (wf) {
+                for (int k = 0; k < KEEP_TAIL; k++) {
+                    int idx = (w + k) % KEEP_TAIL;   /* 从最旧的保留行开始输出 */
+                    if (ring[idx][0]) fputs(ring[idx], wf);
                 }
-                fclose(rf2);
-                FILE *wf = fopen(hf, "w");
-                if (wf) { fputs(keep, wf); fclose(wf); }
-            } else if (rf2) fclose(rf2);
-            free(keep);
+                fclose(wf);
+            }
         }
     }
     hist_unlock();

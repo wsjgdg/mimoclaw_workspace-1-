@@ -3,6 +3,9 @@
  */
 #include "filelock.h"
 #ifndef _WIN32
+#  include <time.h>   /* nanosleep */
+#endif
+#ifndef _WIN32
 #  include <pwd.h>
 #  if defined(__APPLE__)
 #    include <sys/sysctl.h>
@@ -661,8 +664,8 @@ int kill_locker(const Locker *L)
     /* 温和终止后最多等待约 2 秒；进程仍存活则升级 SIGKILL，
      * 避免卡死的进程让“结束进程”看起来毫无效果 */
     for (int i = 0; i < 20; i++) {
-        struct timespec ts = { 0, 100 * 1000 * 1000 };  /* 100ms */
-        nanosleep(&ts, NULL);
+        nanosleep(&(struct timespec){ 0, 100 * 1000 * 1000 }, NULL);
+        
         if (kill((pid_t)L->pid, 0) != 0) return 0;      /* 已退出（或转为僵尸，由 init 回收） */
     }
     return kill((pid_t)L->pid, SIGKILL) == 0 ? 0 : -1;
