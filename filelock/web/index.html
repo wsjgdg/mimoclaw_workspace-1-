@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文件占用诊断器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="logo">🔒</div>
+    <div>
+      <h1>文件占用诊断器</h1>
+      <p>查明文件为什么被占用 · 直接给出解决办法</p>
+    </div>
+  </div>
+  <div class="badge platform" id="platform">检测中…</div>
+</header>
+
+<main>
+
+  <section class="card">
+    <div class="tabs">
+      <button class="tab active" data-tab="scan">📁 文件 / 文件夹检测</button>
+      <button class="tab" data-tab="paste">📋 报错提示分析</button>
+    </div>
+
+    <div class="panel active" id="panel-scan">
+      <div class="row">
+        <input id="pathInput" type="text" spellcheck="false"
+               placeholder="输入或粘贴文件 / 文件夹路径，例如 C:\Users\me\Desktop\报表.xlsx">
+      </div>
+      <div class="row btns">
+        <button class="btn ghost" id="browseFile">🗂 选择文件</button>
+        <button class="btn ghost" id="browseDir">📂 选择文件夹</button>
+        <button class="btn primary" id="scanBtn">🔍 开始检测</button>
+      </div>
+      <div class="drop-hint">💡 也可以直接把文件 / 文件夹拖进页面</div>
+      <label class="check">
+        <input type="checkbox" id="deepScan">
+        递归扫描目录里被打开的文件（更彻底，速度较慢）
+      </label>
+    </div>
+
+    <div class="panel" id="panel-paste">
+      <textarea id="pasteInput" rows="6" spellcheck="false"
+        placeholder="把系统弹出的报错提示粘贴到这里，例如：&#10;“操作无法完成，因为文件已在另一程序中打开。”&#10;“另一个程序正在使用此文件，进程无法访问。”"></textarea>
+      <div class="chips">
+        <span class="chip-label">试试示例：</span>
+        <button class="chip" data-demo="操作无法完成，因为文件已在另一程序中打开。">文件被占用</button>
+        <button class="chip" data-demo="拒绝访问。你需要权限才能执行此操作。">拒绝访问</button>
+        <button class="chip" data-demo="操作无法完成，因为其中的文件夹或文件已在另一程序中打开。请关闭该文件或文件夹，然后重试。">文件夹被占用</button>
+        <button class="chip" data-demo="无法删除文件：磁盘被写保护。">写保护</button>
+      </div>
+      <div class="row btns">
+        <button class="btn primary" id="analyzeBtn">✨ 分析并给出对策</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card hidden" id="resultCard">
+    <div class="result-head">
+      <h2 id="resultTitle">诊断结果</h2>
+      <div class="head-right">
+        <button class="btn primary" id="forceCleanBtn">⚡ 强力清除</button>
+        <button class="btn ghost" id="unlockBtn">🔓 释放占用</button>
+        <button class="btn danger" id="deleteBtn">🗑 删除</button>
+        <button class="btn ghost" id="copyReport">📋 复制报告</button>
+        <div class="conclusion" id="conclusion"></div>
+      </div>
+    </div>
+
+    <div class="status-row" id="statusRow"></div>
+
+    <div class="block hidden" id="batchBlock">
+      <h3>📋 批量检测结果</h3>
+      <table class="locker-table">
+        <thead>
+          <tr><th>路径</th><th>类型</th><th>占用</th><th>结论</th><th></th></tr>
+        </thead>
+        <tbody id="batchBody"></tbody>
+      </table>
+    </div>
+
+    <div class="block hidden" id="lockerBlock">
+      <h3>🧩 占用进程</h3>
+      <table class="locker-table">
+        <thead>
+          <tr><th>PID</th><th>进程名</th><th>路径 / 说明</th><th></th></tr>
+        </thead>
+        <tbody id="lockerBody"></tbody>
+      </table>
+    </div>
+
+    <div class="block hidden" id="reasonBlock">
+      <h3>🔎 原因分析</h3>
+      <ol class="items" id="reasonList"></ol>
+    </div>
+
+    <div class="block hidden" id="fixBlock">
+      <h3>🛠 解决办法</h3>
+      <ol class="items fixes" id="fixList"></ol>
+    </div>
+
+    <div class="block hidden" id="pathBlock">
+      <h3>📎 提示中检测到的路径</h3>
+      <div class="path-links" id="pathLinks"></div>
+    </div>
+  </section>
+
+  <section class="card hidden" id="historyCard">
+    <div class="tips-head">
+      <h3>🕘 检测历史</h3>
+      <button class="btn danger" id="clearHistory">清空历史</button>
+    </div>
+    <div class="history-list" id="historyList"></div>
+  </section>
+
+  <section class="card tips">
+    <div class="tips-head">
+      <h3>💡 小提示</h3>
+      <label class="check">
+        <input type="checkbox" id="clipWatch" checked>
+        自动感知剪贴板里的报错提示
+      </label>
+    </div>
+    <ul>
+      <li>直接把<b>文件/文件夹拖进本页面</b>即可检测（自动定位真实路径）</li>
+      <li>复制报错提示后，页面会自动弹出“立即分析”建议</li>
+      <li>Windows 上顽固占用，可试试重启资源管理器（本工具会给出具体命令）</li>
+      <li>macOS 提示“没有权限”时，记得给 App 授予「完全磁盘访问权限」</li>
+      <li>本工具只监听本机 127.0.0.1，不上传任何数据</li>
+    </ul>
+  </section>
+
+</main>
+
+<div id="dropOverlay" class="drop-overlay hidden">
+  <div class="drop-inner">📥 松开鼠标，立即检测该文件 / 文件夹</div>
+</div>
+<div id="toastWrap"></div>
+
+<footer>filelock · 本地运行 · 数据不出本机</footer>
+<script src="app.js"></script>
+</body>
+</html>
