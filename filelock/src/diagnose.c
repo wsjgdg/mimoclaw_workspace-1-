@@ -256,6 +256,8 @@ static int win_find_lockers(const WCHAR *wpath, Locker *out, int max)
 
 int kill_locker(const Locker *L)
 {
+    /* 自我保护：拒绝结束当前 filelock 进程自身 */
+    if ((long)GetCurrentProcessId() == L->pid) return -1;
     HANDLE hp = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)L->pid);
     if (!hp) return -1;
     int ok = TerminateProcess(hp, 1) ? 0 : -1;
@@ -652,7 +654,18 @@ static int proc_scan(const char *path, Locker *out, int max, int is_dir, int dee
 
 int kill_locker(const Locker *L)
 {
-    return kill((pid_t)L->pid, SIGTERM) == 0 ? 0 : -1;
+    /* 自我保护：绝不结束本进程（filelock 自身不可能占用被诊断文件，
+     * 若 pid 指向自己说明参数异常，直接拒绝） */
+    if ((long)getpid() == L->pid) return -1;
+    if (kill((pid_t)L->pid, SIGTERM) != 0) return -1;
+    /* 温和终止后最多等待约 2 秒；进程仍存活则升级 SIGKILL，
+     * 避免卡死的进程让“结束进程”看起来毫无效果 */
+    for (int i = 0; i < 20; i++) {
+        struct timespec ts = { 0, 100 * 1000 * 1000 };  /* 100ms */
+        nanosleep(&ts, NULL);
+        if (kill((pid_t)L->pid, 0) != 0) return 0;      /* 已退出（或转为僵尸，由 init 回收） */
+    }
+    return kill((pid_t)L->pid, SIGKILL) == 0 ? 0 : -1;
 }
 
 static int diag_posix(const char *path, Report *r, int deep)
