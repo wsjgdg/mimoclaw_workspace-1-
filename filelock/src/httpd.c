@@ -101,12 +101,16 @@ static void send_response(sock_t s, int code, const char *ctype, const char *bod
      * - CSP：脚本/样式仅允许同源与内联，禁 frame/object，进一步压缩 XSS 面。
      * 注：本服务只有 http://127.0.0.1，HSTS 不适用（浏览器会忽略非 https 的
      * HSTS 头），因此不再发送，避免误导。 */
+    /* CORS 策略说明：不再无脑发送 Access-Control-Allow-Origin: *。
+     * 危险 POST 接口要求自定义头 X-Filelock-Token，跨源调用必然触发预检，
+     * 而预检只对本机来源放行 → 跨源写操作已被阻断；GET 数据接口保持同源语义。 */
     int hlen = snprintf(hdr, sizeof(hdr),
                         "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
                         "Connection: close\r\nCache-Control: no-store\r\n"
+                        "Vary: Origin\r\n"
                         "X-Frame-Options: DENY\r\n"
                         "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'\r\n"
-                        "Access-Control-Allow-Origin: *\r\n\r\n",
+                        "\r\n",
                         code, msg, ctype, blen);
     send_all(s, hdr, (size_t)hlen);
     if (blen) send_all(s, body, blen);
@@ -115,6 +119,48 @@ static void send_response(sock_t s, int code, const char *ctype, const char *bod
 static void send_json(sock_t s, const char *json)
 {
     send_response(s, 200, "application/json; charset=utf-8", json, strlen(json));
+}
+
+/* ---------- 流式 JSON（chunked）输出 ----------
+ * 大结果集（批量扫描等）不再受固定 out[] 缓冲区截断：各段生成器直接把
+ * 已格式化的片段写入 socket，边生成边发送，内存占用恒定。
+ * 注意：chunked 响应无 Content-Length，依赖 Connection: close 界定结束。 */
+typedef struct { sock_t s; int failed; } JsonStream;
+
+static void js_begin(JsonStream *js, sock_t s)
+{
+    const char *hdr =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: close\r\nCache-Control: no-store\r\n"
+        "Vary: Origin\r\nX-Frame-Options: DENY\r\n"
+        "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'\r\n"
+        "\r\n";
+    js->s = s;
+    js->failed = 0;
+    send_all(s, hdr, strlen(hdr));
+}
+
+/* 发送一个 chunk（printf 风格）；send 失败则置位 failed，后续调用均为空操作 */
+static void js_printf(JsonStream *js, const char *fmt, ...)
+{
+    if (js->failed) return;
+    char payload[8192];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(payload, sizeof(payload), fmt, ap);
+    va_end(ap);
+    if (n < 0) { js->failed = 1; return; }
+    if ((size_t)n >= sizeof(payload)) n = (int)sizeof(payload) - 1; /* 防御性截断 */
+    char head[32];
+    int hlen = snprintf(head, sizeof(head), "%x\r\n", (unsigned)n);
+    send_all(js->s, head, (size_t)hlen);
+    send_all(js->s, payload, (size_t)n);
+    send_all(js->s, "\r\n", 2);
+}
+
+static void js_end(JsonStream *js)
+{
+    if (!js->failed) send_all(js->s, "0\r\n\r\n", 5);
 }
 
 /* ---------- CSRF 会话令牌 ----------
@@ -244,29 +290,44 @@ static int read_request(sock_t s, char *buf, size_t cap, size_t *out_len)
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
     size_t got = 0;
-    size_t hdr_end = 0;
+    size_t hdr_end = 0;   /* 头部结束位置 + 1（body 起始下标），0 表示尚未收到完整头部 */
     long content_len = -1;
     for (;;) {
         if (got + 1 >= cap) return -1;
         int n = (int)recv(s, buf + got, (int)(cap - got - 1), 0);
-        if (n <= 0) break;
+        if (n == 0) break;               /* 对端正常关闭 */
+        if (n < 0) {                     /* 出错或读超时 */
+#ifdef _WIN32
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK && hdr_end) break;  /* 超时时头部已完整 → 按已收内容处理 */
+#else
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && hdr_end) break;
+#endif
+            return -1;
+        }
         got += (size_t)n;
         buf[got] = 0;
 
         if (!hdr_end) {
-            char *p = strstr(buf, "\r\n\r\n");
-            if (p) {
-                hdr_end = (size_t)(p - buf) + 4;
-                /* 只在头部区域内查 Content-Length：避免请求体里恰好出现
-                 * "Content-Length:" 字样导致跨块读取错误 */
-                char saved = *p;
-                *p = 0;
-                char *cl = strcasestr_compat(buf, "Content-Length:");
-                *p = saved;
-                if (cl) content_len = strtol(cl + 15, NULL, 10);
-                if (content_len < 0) content_len = 0;
-                /* 防御：声明的正文超过缓冲区上限 → 直接拒绝（413），不再读取 */
-                if (content_len > (long)cap - 1) return 2;
+            /* 增量查找 \r\n\r\n：只检查本轮新到达的数据（含上一轮的最后 3 字节，
+             * 覆盖分隔符恰好跨 recv 边界的情况）。避免每轮对整个缓冲做 O(n²) 扫描 */
+            size_t start = (got > (size_t)n + 3) ? got - (size_t)n - 3 : 0;
+            for (size_t i = start; i + 3 < got; i++) {
+                if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+                    buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+                    hdr_end = i + 4;
+                    /* 只在头部区域内查 Content-Length：避免请求体里恰好出现
+                     * "Content-Length:" 字样导致跨块读取错误 */
+                    char saved = buf[i];
+                    buf[i] = 0;
+                    char *cl = strcasestr_compat(buf, "Content-Length:");
+                    buf[i] = saved;
+                    if (cl && cl < buf + i) content_len = strtol(cl + 15, NULL, 10);
+                    if (content_len < 0) content_len = 0;
+                    /* 防御：声明的正文超过缓冲区上限 → 直接拒绝（413），不再读取 */
+                    if (content_len > (long)cap - 1) return 2;
+                    break;
+                }
             }
         }
         if (hdr_end && (long)(got - hdr_end) >= content_len) break;
@@ -413,6 +474,91 @@ static void api_unlock(sock_t s, const char *body)
     send_json(s, out);
 }
 
+/* ---------- 安全删除辅助（CLI / HTTP 共用） ----------
+ * 只读文件直接 remove/rmdir 会失败；先清掉只读属性再删。
+ * 若删除仍失败（目录非空、仍被占用等），把只读属性恢复回去——
+ * 否则用户"没删成"的文件反而丢了保护。 */
+int safe_remove_path(const char *path, int is_dir, char *errbuf, size_t n)
+{
+    int was_ro = 0;
+#ifdef _WIN32
+    WCHAR wpath[4096];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 4096))
+        MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, 4096);
+    DWORD attr = GetFileAttributesW(wpath);
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY)) {
+        was_ro = 1;
+        SetFileAttributesW(wpath, attr & ~FILE_ATTRIBUTE_READONLY);
+    }
+    errbuf[0] = 0;   /* Windows ANSI CRT 不保证设置 errno，统一用 GetLastError 文本 */
+    int rc = is_dir ? _rmdir(path) : _remove(path);
+    if (rc != 0) {
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       NULL, GetLastError(), 0, errbuf, (DWORD)n, NULL);
+        char *nl = strpbrk(errbuf, "\r\n");   /* 去掉尾部换行，便于拼 JSON */
+        if (nl) *nl = 0;
+        if (!errbuf[0]) snprintf(errbuf, n, "错误码 %lu", (unsigned long)GetLastError());
+        if (was_ro) {
+            attr = GetFileAttributesW(wpath);
+            if (attr != INVALID_FILE_ATTRIBUTES)
+                return SetFileAttributesW(wpath, attr | FILE_ATTRIBUTE_READONLY) ? -2 : -1;
+            return -2;   /* 无法恢复只读 */
+        }
+        return -1;
+    }
+    return 0;
+#else
+    struct stat st;
+    if (stat(path, &st) == 0 && !(st.st_mode & S_IWUSR)) {
+        was_ro = 1;
+        chmod(path, st.st_mode | S_IWUSR);
+    }
+    int rc = is_dir ? rmdir(path) : remove(path);
+    if (rc != 0) {
+        snprintf(errbuf, n, "%s", strerror(errno));
+        if (was_ro) {
+            if (stat(path, &st) == 0) return chmod(path, st.st_mode & ~S_IWUSR);
+            return -2;
+        }
+        return -1;
+    }
+    (void)errbuf; (void)n;
+    return 0;
+#endif
+}
+
+/* 自我保护：路径是否落在 webroot（本程序界面目录）内。
+ * 源码运行模式下 webroot 指向仓库 web/，误删会导致界面丢失；
+ * 匹配时做大小写归一化（Windows 文件名不区分大小写），并同时比对
+ * 绝对 webroot 与进程当前工作目录下的相对 "web" 两种形态。 */
+static int path_in_webroot(const char *path)
+{
+    if (!path || !path[0]) return 0;
+    char cwd[4096] = "";
+    const char *roots[2];
+    size_t lens[2];
+    int nr = 0;
+    if (g_webroot[0]) { roots[nr] = g_webroot; lens[nr] = strlen(g_webroot); nr++; }
+    if (getcwd(cwd, sizeof(cwd))) {
+        static char rel[4160];
+        snprintf(rel, sizeof(rel), "%s/web", cwd);
+        roots[nr] = rel; lens[nr] = strlen(rel); nr++;
+    }
+    for (int k = 0; k < nr; k++) {
+        size_t wl = lens[k];
+        int match = 1;
+        if (strlen(path) < wl) continue;
+        for (size_t i = 0; i < wl; i++) {
+            char a = path[i], b = roots[k][i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b && !(b == '/' && a == '\\')) { match = 0; break; }
+        }
+        if (match && (path[wl] == '/' || path[wl] == '\\' || path[wl] == 0)) return 1;
+    }
+    return 0;
+}
+
 static void api_act(sock_t s, const char *body)
 {
     char path[4096] = "", op[32] = "";
@@ -427,23 +573,26 @@ static void api_act(sock_t s, const char *body)
     }
     /* 自我保护：拒绝删除本程序目录下的 web 资源（源码运行模式下
      * webroot 指向仓库内 web/，误删会导致界面丢失） */
-    if (g_webroot[0]) {
-        size_t wl = strlen(g_webroot);
-        if (strncmp(path, g_webroot, wl) == 0 && (path[wl] == '/' || path[wl] == '\\')) {
-            send_json(s, "{\"ok\":0,\"error\":\"出于安全考虑，不允许删除 filelock 自身的界面文件\"}");
-            return;
-        }
+    if (path_in_webroot(path)) {
+        send_json(s, "{\"ok\":0,\"error\":\"出于安全考虑，不允许删除 filelock 自身的界面文件\"}");
+        return;
     }
     struct stat st;
     int is_dir = (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
-    int rc = is_dir ? rmdir(path) : remove(path);
-    if (rc == 0) {
+    /* 只读文件先解除只读再删；删除失败时自动恢复只读属性 */
+    char e[256] = "";
+    int src = safe_remove_path(path, is_dir, e, sizeof(e));
+    if (src == 0) {
         send_json(s, "{\"ok\":1,\"deleted\":1}");
     } else {
-        char e[256], esc[512], out[600];
-        snprintf(e, sizeof(e), "%s（%s）", strerror(errno),
-                 is_dir ? "目录需为空才能删除" : "文件可能仍被占用或只读");
-        json_escape(e, esc, sizeof(esc));
+        char esc[512], out[700];
+        char msg[320];
+        snprintf(msg, sizeof(msg), "%s（%s）", e[0] ? e : "删除失败",
+                 is_dir ? "目录需为空才能删除" : "文件可能仍被占用");
+        if (src == -2)
+            snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
+                     "；注意：只读属性恢复失败，请手动检查");
+        json_escape(msg, esc, sizeof(esc));
         snprintf(out, sizeof(out), "{\"ok\":0,\"error\":\"%s\"}", esc);
         send_json(s, out);
     }
@@ -457,9 +606,11 @@ static void api_scan_batch(sock_t s, const char *body)
         send_json(s, "{\"ok\":0,\"error\":\"缺少 paths 数组\"}");
         return;
     }
-    char out[65536];
-    size_t o = (size_t)snprintf(out, sizeof(out), "{\"ok\":1,\"results\":[");
-    for (int i = 0; i < n && o + 1200 < sizeof(out); i++) {
+    /* 流式输出：每个路径的诊断结果即时写入 socket，不再受固定缓冲区截断 */
+    JsonStream js;
+    js_begin(&js, s);
+    js_printf(&js, "{\"ok\":1,\"results\":[");
+    for (int i = 0; i < n; i++) {
         Report r;
         diagnose_path(paths[i], &r, 0);
         history_add(paths[i], &r);
@@ -469,14 +620,14 @@ static void api_scan_batch(sock_t s, const char *body)
         char e1[ITEM_LEN * 2], e2[ITEM_LEN * 2];
         json_escape(paths[i], e1, sizeof(e1));
         json_escape(con, e2, sizeof(e2));
-        o += (size_t)snprintf(out + o, sizeof(out) - o,
+        js_printf(&js,
             "%s{\"path\":\"%s\",\"exists\":%d,\"isDir\":%d,\"canDelete\":%d,"
             "\"nlockers\":%d,\"restricted\":%d,\"conclusion\":\"%s\"}",
             i ? "," : "", e1, r.exists, r.is_dir, r.can_delete,
             r.nlockers, r.restricted, e2);
     }
-    snprintf(out + o, sizeof(out) - o, "]}");
-    send_json(s, out);
+    js_printf(&js, "]}");
+    js_end(&js);
 }
 
 static void api_force_clean(sock_t s, const char *body)
@@ -490,12 +641,9 @@ static void api_force_clean(sock_t s, const char *body)
     int is_dir = (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
 
     /* 自我保护：拒绝删除本程序目录下的 web 资源（与 /api/act 同规则） */
-    if (g_webroot[0]) {
-        size_t wl = strlen(g_webroot);
-        if (strncmp(path, g_webroot, wl) == 0 && (path[wl] == '/' || path[wl] == '\\')) {
-            send_json(s, "{\"ok\":0,\"error\":\"出于安全考虑，不允许删除 filelock 自身的界面文件\"}");
-            return;
-        }
+    if (path_in_webroot(path)) {
+        send_json(s, "{\"ok\":0,\"error\":\"出于安全考虑，不允许删除 filelock 自身的界面文件\"}");
+        return;
     }
 
     /* 1) 句柄级解锁（Windows） */
@@ -504,13 +652,17 @@ static void api_force_clean(sock_t s, const char *body)
     char unlock_err[256] = "";
     close_file_handles(path, is_dir, &closed, hits, 32, unlock_err, sizeof(unlock_err));
 
-    /* 2) 删除 */
+    /* 2) 删除（只读文件先解除只读，失败自动恢复） */
     int deleted = 0;
     char del_err[256] = "";
-    int rc = is_dir ? rmdir(path) : remove(path);
-    if (rc == 0) deleted = 1;
-    else snprintf(del_err, sizeof(del_err), "%s（%s）", strerror(errno),
-                  is_dir ? "目录需为空" : "可能仍被占用或只读");
+    if (safe_remove_path(path, is_dir, del_err, sizeof(del_err)) == 0) deleted = 1;
+    else {
+        const char *hint = is_dir ? "目录需为空" : "可能仍被占用";
+        char tmp[320];
+        snprintf(tmp, sizeof(tmp), "%s（%s）", del_err[0] ? del_err : "删除失败", hint);
+        memcpy(del_err, tmp, sizeof(del_err));   /* 定长拷贝，避免自拼接告警 */
+        del_err[sizeof(del_err) - 1] = 0;
+    }
 
     /* 3) 复测 */
     Report r;
@@ -526,10 +678,39 @@ static void api_force_clean(sock_t s, const char *body)
     send_json(s, out);
 }
 
-static void api_history(sock_t s)
+/* 解析查询串中的整数参数（如 ?page=2&per=10），找不到返回 dflt */
+static int query_int(const char *qs, const char *key, int dflt)
 {
-    HistoryItem items[20];
-    int n = history_list(items, 20);
+    if (!qs || !*qs) return dflt;
+    size_t klen = strlen(key);
+    for (const char *p = qs; *p; ) {
+        p += strspn(p, "&?");
+        if (!*p) break;
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            return atoi(p + klen + 1);
+        }
+        size_t adv = strcspn(p, "&");
+        if (adv == 0) p++; else p += adv;
+    }
+    return dflt;
+}
+
+/* 历史分页 API：GET /api/history?page=N&per=M（默认第 0 页，每页 10 条）。
+ * 响应为流式 chunked JSON：{"ok":1,"items":[...],"page":N,"per":M,"total":T} */
+static void api_history(sock_t s, const char *query)
+{
+    int page = query_int(query, "page", 0);
+    int per  = query_int(query, "per", 10);
+    if (page < 0) page = 0;
+    if (per < 1) per = 10;
+    if (per > 50) per = 50;                 /* 单页上限 */
+
+    /* 修复越界：per 上限 100（与 history_page 对齐），items 容量必须同步为 100，
+     * 否则 ?per=50..100 时 history_page 会向栈数组越界写入 */
+    HistoryItem items[100];
+    long long total = 0;
+    int n = history_page(items, per, page, per, &total);
+
     /* 防御：若历史文件被外部篡改，path 字段可能指向本程序内嵌的
      * index.html/app.js/style.css——用户点击历史记录会触发删除/解锁，
      * 因此拒绝展示与内嵌 Web 资源同名的条目。 */
@@ -546,26 +727,45 @@ static void api_history(sock_t s)
         }
         if (bad) { memmove(&items[i], &items[i + 1], (size_t)(n - 1 - i) * sizeof(HistoryItem)); n--; }
     }
-    char out[48000];
-    size_t o = (size_t)snprintf(out, sizeof(out), "{\"ok\":1,\"items\":[");
-    for (int i = 0; i < n && o + 2048 < sizeof(out); i++) {
+
+    JsonStream js;
+    js_begin(&js, s);
+    js_printf(&js, "{\"ok\":1,\"items\":[");
+    for (int i = 0; i < n; i++) {
         char e1[ITEM_LEN * 2], e2[ITEM_LEN * 2];
         json_escape(items[i].path, e1, sizeof(e1));
         json_escape(items[i].conclusion, e2, sizeof(e2));
-        o += (size_t)snprintf(out + o, sizeof(out) - o,
+        js_printf(&js,
             "%s{\"path\":\"%s\",\"conclusion\":\"%s\",\"exists\":%d,"
             "\"nlockers\":%d,\"restricted\":%d,\"ts\":%lld}",
             i ? "," : "", e1, e2, items[i].exists, items[i].nlockers,
             items[i].restricted, items[i].ts);
     }
-    snprintf(out + o, sizeof(out) - o, "]}");
-    send_json(s, out);
+    js_printf(&js, "],\"page\":%d,\"per\":%d,\"total\":%lld}", page, per, total);
+    js_end(&js);
 }
 
 static void api_history_clear(sock_t s)
 {
     int rc = history_clear();
     send_json(s, rc == 0 ? "{\"ok\":1}" : "{\"ok\":0,\"error\":\"清空失败\"}");
+}
+
+/* ---------- /api/health —— 只读健康检查（供自动化测试 / 监控使用） ----------
+ * GET 请求、无需令牌；输出运行状态、会话活跃标记、版本号与服务启动时间。
+ * 刻意不泄露令牌本身，tokenReady 仅表示"已生成"。 */
+static volatile long long g_start_time = 0;
+
+static void api_health(sock_t s)
+{
+    char out[512];
+    time_t now = time(NULL);
+    long long uptime = g_start_time ? (long long)now - g_start_time : 0;
+    snprintf(out, sizeof(out),
+             "{\"ok\":1,\"status\":\"healthy\",\"version\":\"1.2\","
+             "\"tokenReady\":%d,\"activeConns\":%ld,\"uptimeSec\":%lld,\"time\":%lld}",
+             httpd_get_token()[0] ? 1 : 0, conn_count(), uptime, (long long)now);
+    send_json(s, out);
 }
 
 static void api_browse(sock_t s, const char *body)
@@ -763,6 +963,15 @@ static void handle_conn(sock_t s, const char *webroot)
 
     char method[8] = "", url[1024] = "";
     sscanf(buf, "%7s %1023s", method, url);
+    /* 保留查询串（路由前）：/api/history?page=N&per=M 等分页参数依赖它 */
+    char query[512] = "";
+    {
+        char *q0 = strchr(url, '?');
+        if (q0) {
+            snprintf(query, sizeof(query), "%s", q0 + 1);
+            *q0 = 0;
+        }
+    }
     char *body = strstr(buf, "\r\n\r\n");
     body = body ? body + 4 : buf + len;
 
@@ -797,18 +1006,15 @@ static void handle_conn(sock_t s, const char *webroot)
     }
 
     if (strcmp(method, "GET") == 0) {
-        /* 去掉查询串再路由，兼容 /api/xxx?v=1 之类的写法 */
-        char *q = strchr(url, '?');
-        if (q) *q = 0;
+        /* 查询串已在路由前提取到 query（兼容 /api/xxx?v=1 之类的写法） */
         if (strcmp(url, "/favicon.ico") == 0) {
             send_response(s, 200, "image/svg+xml", EMB_FAVICON_SVG, sizeof(EMB_FAVICON_SVG) - 1);
         } else if (strcmp(url, "/api/init") == 0) api_init(s);
+        else if (strcmp(url, "/api/health") == 0) api_health(s);
         else if (strcmp(url, "/api/clipboard") == 0) api_clipboard(s);
-        else if (strcmp(url, "/api/history") == 0) api_history(s);
+        else if (strcmp(url, "/api/history") == 0) api_history(s, query);
         else serve_static(s, webroot, url);
     } else if (strcmp(method, "POST") == 0) {
-        char *q = strchr(url, '?');
-        if (q) *q = 0;
         /* CSRF 防护：所有 /api/ 危险操作必须携带有效会话令牌（恒定时间比较） */
         if (strncmp(url, "/api/", 5) == 0) {
             char tok[128] = "";
@@ -828,7 +1034,7 @@ static void handle_conn(sock_t s, const char *webroot)
         else if (strcmp(url, "/api/locate") == 0) api_locate(s, body);
         else if (strcmp(url, "/api/unlock") == 0) api_unlock(s, body);
         else if (strcmp(url, "/api/act") == 0) api_act(s, body);
-        else if (strcmp(url, "/api/history") == 0) api_history(s);      /* GET/POST 均支持 */
+        else if (strcmp(url, "/api/history") == 0) api_history(s, query);  /* GET/POST 均支持 */
         else if (strcmp(url, "/api/history/clear") == 0) api_history_clear(s);
         else send_response(s, 404, "application/json", "{\"ok\":0,\"error\":\"未知接口\"}", 30);
     } else {
@@ -893,6 +1099,7 @@ int httpd_serve(const char *webroot, int *port, void (*on_ready)(int port))
     if (listen(srv, 8) == SOCK_ERR) { CLOSESOCK(srv); return -1; }
 
     snprintf(g_webroot, sizeof(g_webroot), "%s", webroot ? webroot : "");
+    g_start_time = (long long)time(NULL);   /* /api/health 的 uptime 基准 */
     if (on_ready) on_ready(*port);
 
     for (;;) {
