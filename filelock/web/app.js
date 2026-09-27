@@ -652,7 +652,7 @@
     catch (e) { showError("导出失败：" + e.message); }
   });
 
-  /* ---------- 检测历史 ---------- */
+  /* ---------- 检测历史（分页） ---------- */
   function fmtTime(ts) {
     if (!ts) return "";
     const d = new Date(ts * 1000);
@@ -660,10 +660,15 @@
     return d.getMonth() + 1 + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
   }
 
-  async function loadHistory() {
+  const HIST_PER = 10;
+  let histPage = 0, histTotal = 0;
+
+  async function loadHistory(page) {
     try {
-      const d = await api("/api/history", {});
+      if (typeof page === "number") histPage = page;
+      const d = await api("/api/history?page=" + histPage + "&per=" + HIST_PER, {});
       const items = (d && d.items) || [];
+      histTotal = (d && typeof d.total === "number") ? d.total : items.length;
       const card = $("historyCard"), list = $("historyList");
       if (!items.length) { card.classList.add("hidden"); return; }
       card.classList.remove("hidden");
@@ -682,13 +687,29 @@
           runScan(p);
         });
       });
+      /* 分页控件：总页数 > 1 时显示 */
+      const pages = Math.max(1, Math.ceil(histTotal / HIST_PER));
+      if (histPage >= pages) { histPage = Math.max(0, pages - 1); return loadHistory(); }
+      const pager = $("histPager");
+      if (pages > 1) {
+        pager.classList.remove("hidden");
+        $("histPageInfo").textContent = "第 " + (histPage + 1) + " / " + pages + " 页（共 " + histTotal + " 条）";
+        $("histPrev").disabled = histPage <= 0;
+        $("histNext").disabled = histPage >= pages - 1;
+      } else {
+        pager.classList.add("hidden");
+      }
     } catch (e) { /* 忽略 */ }
   }
+
+  $("histPrev").addEventListener("click", () => { if (histPage > 0) loadHistory(histPage - 1); });
+  $("histNext").addEventListener("click", () => { loadHistory(histPage + 1); });
 
   $("clearHistory").addEventListener("click", async () => {
     if (!confirm("确定清空检测历史吗？")) return;
     await api("/api/history/clear", {});
     $("historyCard").classList.add("hidden");
+    histPage = 0; histTotal = 0;
   });
 
   loadHistory();

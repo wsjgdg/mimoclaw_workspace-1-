@@ -92,17 +92,40 @@ int history_add(const char *path, const Report *r)
 
 int history_list(HistoryItem *out, int max)
 {
+    return history_page(out, max, 0, max > 0 ? max : 20, NULL);
+}
+
+/* 分页读取：page 从 0 开始，每页 per_page 条（新→旧）。
+ * out_cap 为调用方数组容量。返回本页实际条数，*total_out 输出过滤前总条数。 */
+int history_page(HistoryItem *out, int out_cap, int page, int per_page, long long *total_out)
+{
+    if (per_page < 1) per_page = 20;
+    if (per_page > 100) per_page = 100;   /* 单页上限，防御超大请求 */
+    if (page < 0) page = 0;
+    if (out_cap < 0) out_cap = 0;
     char hf[2048];
     history_file(hf, sizeof(hf));
     hist_lock();
     FILE *f = fopen(hf, "r");
-    if (!f) { hist_unlock(); return 0; }
+    if (!f) {
+        hist_unlock();
+        if (total_out) *total_out = 0;
+        return 0;
+    }
 
-    /* 先全部读入，再倒序输出（最新的在前） */
-    char **lines = (char **)calloc((size_t)max + 200, sizeof(char *));
-    int n = 0;
+    /* 先全部读入行，再倒序（最新的在前）取对应页区间 */
+    int cap = 256, n = 0;
+    char **lines = (char **)calloc((size_t)cap, sizeof(char *));
     char buf[2048];
-    while (fgets(buf, sizeof(buf), f) && n < max + 199) {
+    while (fgets(buf, sizeof(buf), f)) {
+        if (n >= HISTORY_FILE_MAX + 50) break;   /* 文件理论上已被截断，双保险 */
+        if (n == cap) {
+            char **nl = (char **)realloc(lines, (size_t)cap * 2 * sizeof(char *));
+            if (!nl) break;
+            lines = nl;
+            memset(lines + cap, 0, (size_t)cap * sizeof(char *));
+            cap *= 2;
+        }
         lines[n] = (char *)malloc(strlen(buf) + 1);
         if (lines[n]) strcpy(lines[n], buf);
         n++;
@@ -110,19 +133,24 @@ int history_list(HistoryItem *out, int max)
     fclose(f);
     hist_unlock();
 
+    if (total_out) *total_out = n;
+
+    long long start = (long long)page * per_page;      /* 本页起始（倒序偏移） */
+    long long stop  = start + per_page;                /* 不含 */
     int count = 0;
-    for (int i = n - 1; i >= 0 && count < max; i--) {
-        if (!lines[i]) continue;
+    for (long long i = start; i < stop && i < n; i++) {
+        int idx = n - 1 - (int)i;                      /* 倒序映射到正序行号 */
+        if (idx < 0 || !lines[idx]) continue;
         HistoryItem *h = &out[count];
         memset(h, 0, sizeof(*h));
-        json_get_string(lines[i], "path", h->path, sizeof(h->path));
-        json_get_string(lines[i], "conclusion", h->conclusion, sizeof(h->conclusion));
-        h->exists = atoi(strstr(lines[i], "\"exists\":") ? strstr(lines[i], "\"exists\":") + 9 : "0");
+        json_get_string(lines[idx], "path", h->path, sizeof(h->path));
+        json_get_string(lines[idx], "conclusion", h->conclusion, sizeof(h->conclusion));
+        h->exists = atoi(strstr(lines[idx], "\"exists\":") ? strstr(lines[idx], "\"exists\":") + 9 : "0");
         char *p;
-        p = strstr(lines[i], "\"nlockers\":");  h->nlockers = p ? atoi(p + 11) : 0;
-        p = strstr(lines[i], "\"restricted\":"); h->restricted = p ? atoi(p + 12) : 0;
-        p = strstr(lines[i], "\"ts\":");         h->ts = p ? (long long)atol(p + 5) : 0;
-        if (h->path[0]) count++;
+        p = strstr(lines[idx], "\"nlockers\":");  h->nlockers = p ? atoi(p + 11) : 0;
+        p = strstr(lines[idx], "\"restricted\":"); h->restricted = p ? atoi(p + 12) : 0;
+        p = strstr(lines[idx], "\"ts\":");         h->ts = p ? (long long)atol(p + 5) : 0;
+        if (h->path[0] && count < out_cap) count++;
     }
     for (int i = 0; i < n; i++) free(lines[i]);
     free(lines);

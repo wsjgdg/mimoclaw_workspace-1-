@@ -4,6 +4,8 @@
 #   make clean    清理
 
 CC      ?= cc
+# _DEFAULT_SOURCE: 严格模式下显式暴露 nanosleep/strcasestr 等 POSIX 扩展
+CFLAGS  += -D_DEFAULT_SOURCE
 CFLAGS  ?= -O2 -Wall -Wextra
 BIN     := filelock
 EMBED   := src/web_embedded.h

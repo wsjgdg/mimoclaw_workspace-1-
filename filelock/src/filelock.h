@@ -138,12 +138,20 @@ int  locate_path(const char *name, char out[][ITEM_LEN], int max);
 /* ---- history.c ---- */
 int  history_add(const char *path, const Report *r);
 int  history_list(HistoryItem *out, int max);   /* 新→旧，返回条数 */
+/* 分页读取：page 从 0 开始，每页 per_page 条（新→旧）；out_cap 为数组容量，
+ * total_out 可选输出总条数（用于前端计算页数）。返回本页条数。 */
+int  history_page(HistoryItem *out, int out_cap, int page, int per_page, long long *total_out);
 int  history_clear(void);
 
 /* ---- close_handle.c ---- */
 /* Windows：不杀进程，直接关闭占用句柄；成功返回 0；closed 为关闭的句柄数 */
 int  close_file_handles(const char *path, int is_dir, int *closed,
                         UnlockHit *hits, int maxhits, char *err, size_t ne);
+
+/* ---- httpd.c（供 CLI/HTTP 共用的删除辅助）---- */
+/* 安全删除：先解除只读属性再删；目录非空/仍被占用时自动恢复原只读状态。
+ * 返回 0=成功；-1=失败且已恢复只读；-2=失败但无法恢复只读（需提示用户）。 */
+int  safe_remove_path(const char *path, int is_dir, char *errbuf, size_t n);
 
 /* ---- menu.c ---- */
 /* 右键菜单集成（Windows 注册表）：1=成功 0=失败 */
